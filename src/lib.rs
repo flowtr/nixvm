@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
+use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::AbiParam;
 use cranelift_codegen::ir::Function;
@@ -7,14 +10,33 @@ use cranelift_codegen::ir::Signature;
 use cranelift_codegen::ir::UserFuncName;
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::Context as CraneliftContext;
+use cranelift_frontend::Variable;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataContext, Linkage, Module};
 use rnix::ast::BinOp;
 use rnix::ast::BinOpKind;
 use rnix::ast::Expr;
+use rnix::ast::HasEntry;
 use rnix::ast::Literal;
 use rnix::ast::LiteralKind;
+
+/// Declare a single variable declaration.
+pub fn declare_variable(
+    int: types::Type,
+    builder: &mut FunctionBuilder,
+    variables: &mut HashMap<String, Variable>,
+    index: &mut usize,
+    name: &str,
+) -> Variable {
+    let var = Variable::new(*index);
+    if !variables.contains_key(name) {
+        variables.insert(name.into(), var);
+        builder.declare_var(var, int);
+        *index += 1;
+    }
+    var
+}
 
 pub fn compile_literal(
     builder: &mut FunctionBuilder,
@@ -39,10 +61,14 @@ pub fn compile_expression(
     data_context: &mut DataContext,
     builder: &mut FunctionBuilder,
     expr: &Expr,
+    variable_index: &mut usize,
+    variables: &mut HashMap<String, Variable>,
 ) -> Result<Option<cranelift_codegen::ir::Value>> {
     let compile_bin_op = |module: &mut JITModule,
                           data_context: &mut DataContext,
                           builder: &mut FunctionBuilder,
+                          variable_index: &mut usize,
+                          variables: &mut HashMap<String, Variable>,
                           operator: &BinOp| {
         let left = compile_expression(
             module,
@@ -51,6 +77,8 @@ pub fn compile_expression(
             &operator
                 .lhs()
                 .context("failed to compile left expression")?,
+            variable_index,
+            variables,
         )?;
         let right = compile_expression(
             module,
@@ -59,6 +87,8 @@ pub fn compile_expression(
             &operator
                 .rhs()
                 .context("failed to compile right expression")?,
+            variable_index,
+            variables,
         )?;
 
         if left.is_none() || right.is_none() {
@@ -127,7 +157,7 @@ pub fn compile_expression(
             let mut func_ctx = FunctionBuilderContext::new();
             let mut func = Function::with_name_signature(
                 UserFuncName::testcase(func_name),
-                Signature::new(CallConv::triple_default(&module.isa().triple())),
+                Signature::new(CallConv::triple_default(module.isa().triple())),
             );
             func.signature.params.push(AbiParam::new(types::I64));
             func.signature.returns.push(AbiParam::new(types::I64));
@@ -139,7 +169,14 @@ pub fn compile_expression(
             func_builder.switch_to_block(entry_block);
             func_builder.seal_block(entry_block);
 
-            let body_value = compile_expression(module, data_context, &mut func_builder, &body)?;
+            let body_value = compile_expression(
+                module,
+                data_context,
+                &mut func_builder,
+                &body,
+                variable_index,
+                variables,
+            )?;
             if body_value.is_none() {
                 return Err(anyhow::anyhow!("failed to compile lambda body"));
             }
@@ -150,7 +187,68 @@ pub fn compile_expression(
 
             Ok(None)
         }
-        Expr::BinOp(operator) => compile_bin_op(module, data_context, builder, operator),
+        Expr::Ident(ident) => {
+            let ident = ident.to_string();
+            let variable = variables.get(&ident).context("failed to get variable")?;
+            Ok(Some(builder.use_var(*variable)))
+        }
+        Expr::LetIn(let_in) => {
+            let body = let_in.body().context("failed to get let in body")?;
+            let values = let_in.attrpath_values();
+
+            for value in values {
+                let attr_path = value.attrpath().context("failed to get attr path")?;
+                let key = attr_path
+                    .attrs()
+                    .map(|attr| match attr {
+                        rnix::ast::Attr::Ident(ident) => ident.to_string(),
+                        rnix::ast::Attr::Str(str) => str.to_string(),
+                        _ => "".to_string(),
+                    })
+                    .collect::<Vec<String>>()
+                    .join(".");
+                let value = value.value().context("failed to get value")?;
+                let value = compile_expression(
+                    module,
+                    data_context,
+                    builder,
+                    &value,
+                    variable_index,
+                    variables,
+                )?;
+
+                if value.is_none() {
+                    return Err(anyhow::anyhow!("failed to compile let in value"));
+                }
+
+                let variable = declare_variable(
+                    module.isa().pointer_type().as_int(),
+                    builder,
+                    variables,
+                    variable_index,
+                    &key,
+                );
+
+                builder.def_var(variable, value.unwrap());
+            }
+
+            compile_expression(
+                module,
+                data_context,
+                builder,
+                &body,
+                variable_index,
+                variables,
+            )
+        }
+        Expr::BinOp(operator) => compile_bin_op(
+            module,
+            data_context,
+            builder,
+            variable_index,
+            variables,
+            operator,
+        ),
         Expr::Literal(node) => Ok(Some(compile_literal(builder, node)?)),
         Expr::Str(node) => {
             let string_parts = node.normalized_parts();
@@ -167,6 +265,8 @@ pub fn compile_expression(
                             data_context,
                             builder,
                             &expr.context("failed to compile interpolation expression")?,
+                            variable_index,
+                            variables,
                         )?;
 
                         return Ok(value);
@@ -198,6 +298,8 @@ pub struct Compiler {
     function_context: FunctionBuilderContext,
     codegen_context: CraneliftContext,
     data_context: DataContext,
+    variable_index: usize,
+    variables: HashMap<String, Variable>,
 }
 
 impl Compiler {
@@ -213,6 +315,8 @@ impl Compiler {
             function_context,
             codegen_context,
             data_context,
+            variable_index: 0,
+            variables: HashMap::new(),
         })
     }
 
@@ -227,8 +331,14 @@ impl Compiler {
         builder.seal_block(entry_block);
 
         let mut stack = vec![];
-        let value =
-            compile_expression(&mut self.module, &mut self.data_context, &mut builder, expr)?;
+        let value = compile_expression(
+            &mut self.module,
+            &mut self.data_context,
+            &mut builder,
+            expr,
+            &mut self.variable_index,
+            &mut self.variables,
+        )?;
         if let Some(value) = value {
             stack.push(value);
         }
