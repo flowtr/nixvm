@@ -63,12 +63,14 @@ pub fn compile_expression(
     expr: &Expr,
     variable_index: &mut usize,
     variables: &mut HashMap<String, Variable>,
+    functions: &mut HashMap<String, Signature>,
 ) -> Result<Option<cranelift_codegen::ir::Value>> {
     let compile_bin_op = |module: &mut JITModule,
                           data_context: &mut DataContext,
                           builder: &mut FunctionBuilder,
                           variable_index: &mut usize,
                           variables: &mut HashMap<String, Variable>,
+                          functions: &mut HashMap<String, Signature>,
                           operator: &BinOp| {
         let left = compile_expression(
             module,
@@ -79,6 +81,7 @@ pub fn compile_expression(
                 .context("failed to compile left expression")?,
             variable_index,
             variables,
+            functions,
         )?;
         let right = compile_expression(
             module,
@@ -89,6 +92,7 @@ pub fn compile_expression(
                 .context("failed to compile right expression")?,
             variable_index,
             variables,
+            functions,
         )?;
 
         if left.is_none() || right.is_none() {
@@ -156,7 +160,7 @@ pub fn compile_expression(
             // Create a new function with the compiled body and the parameter
             let mut func_ctx = FunctionBuilderContext::new();
             let mut func = Function::with_name_signature(
-                UserFuncName::testcase(func_name),
+                UserFuncName::testcase(&func_name),
                 Signature::new(CallConv::triple_default(module.isa().triple())),
             );
             func.signature.params.push(AbiParam::new(types::I64));
@@ -176,6 +180,7 @@ pub fn compile_expression(
                 &body,
                 variable_index,
                 variables,
+                functions,
             )?;
             if body_value.is_none() {
                 return Err(anyhow::anyhow!("failed to compile lambda body"));
@@ -185,12 +190,76 @@ pub fn compile_expression(
 
             func_builder.finalize();
 
+            functions.insert(func_name, func.signature.clone());
+
             Ok(None)
         }
         Expr::Ident(ident) => {
             let ident = ident.to_string();
             let variable = variables.get(&ident).context("failed to get variable")?;
             Ok(Some(builder.use_var(*variable)))
+        }
+        Expr::Apply(apply) => {
+            let lambda = apply.lambda().context("failed to get apply lambda")?;
+            let argument = apply.argument().context("failed to get apply argument")?;
+
+            let argument = compile_expression(
+                module,
+                data_context,
+                builder,
+                &argument,
+                variable_index,
+                variables,
+                functions,
+            )?;
+
+            let func_name = match lambda {
+                Expr::Select(select) => {
+                    let attr_path = select
+                        .attrpath()
+                        .context("failed to get select attr path")?;
+
+                    attr_path
+                        .attrs()
+                        .map(|attr| match attr {
+                            rnix::ast::Attr::Ident(ident) => ident.to_string(),
+                            rnix::ast::Attr::Str(str) => str.to_string(),
+                            _ => "".to_string(),
+                        })
+                        .collect::<Vec<String>>()
+                        .join(".")
+                }
+                Expr::Ident(ident) => ident.to_string(),
+                _ => anyhow::bail!("unknown function type"),
+            };
+
+            let signature = functions.get(&func_name);
+            if let Some(signature) = signature {
+                let func = module.declare_function(&func_name, Linkage::Import, signature)?;
+                let func = module.declare_func_in_func(func, builder.func);
+
+                builder.ins().call(func, &[argument.unwrap()]);
+
+                Ok(None)
+            } else {
+                // TODO: Built-in functions
+                // Let's assume we are using printf for now
+                let func = module.declare_function(
+                    "printf",
+                    Linkage::Import,
+                    &Signature {
+                        params: vec![AbiParam::new(types::I64)],
+                        returns: vec![AbiParam::new(types::I64)],
+                        call_conv: CallConv::triple_default(module.isa().triple()),
+                    },
+                )?;
+
+                let func = module.declare_func_in_func(func, builder.func);
+
+                builder.ins().call(func, &[argument.unwrap()]);
+
+                Ok(None)
+            }
         }
         Expr::LetIn(let_in) => {
             let body = let_in.body().context("failed to get let in body")?;
@@ -215,6 +284,7 @@ pub fn compile_expression(
                     &value,
                     variable_index,
                     variables,
+                    functions,
                 )?;
 
                 if value.is_none() {
@@ -228,7 +298,6 @@ pub fn compile_expression(
                     variable_index,
                     &key,
                 );
-
                 builder.def_var(variable, value.unwrap());
             }
 
@@ -239,6 +308,7 @@ pub fn compile_expression(
                 &body,
                 variable_index,
                 variables,
+                functions,
             )
         }
         Expr::BinOp(operator) => compile_bin_op(
@@ -247,6 +317,7 @@ pub fn compile_expression(
             builder,
             variable_index,
             variables,
+            functions,
             operator,
         ),
         Expr::Literal(node) => Ok(Some(compile_literal(builder, node)?)),
@@ -267,6 +338,7 @@ pub fn compile_expression(
                             &expr.context("failed to compile interpolation expression")?,
                             variable_index,
                             variables,
+                            functions,
                         )?;
 
                         return Ok(value);
@@ -300,6 +372,7 @@ pub struct Compiler {
     data_context: DataContext,
     variable_index: usize,
     variables: HashMap<String, Variable>,
+    functions: HashMap<String, Signature>,
 }
 
 impl Compiler {
@@ -317,6 +390,7 @@ impl Compiler {
             data_context,
             variable_index: 0,
             variables: HashMap::new(),
+            functions: HashMap::new(),
         })
     }
 
@@ -338,14 +412,21 @@ impl Compiler {
             expr,
             &mut self.variable_index,
             &mut self.variables,
+            &mut self.functions,
         )?;
         if let Some(value) = value {
             stack.push(value);
         }
 
-        let return_value = stack.pop().context("failed to get return value")?;
+        let return_value = stack.pop();
 
-        builder.ins().return_(&[return_value]);
+        if let Some(return_value) = return_value {
+            builder.ins().return_(&[return_value]);
+        } else {
+            let return_value = builder.ins().iconst(types::I64, 0);
+            builder.ins().return_(&[return_value]);
+        }
+
         builder.finalize();
         let id = self.module.declare_function(
             "main",
@@ -357,8 +438,6 @@ impl Compiler {
         self.module.finalize_definitions()?;
         let code_ptr = self.module.get_finalized_function(id);
         let main: fn() -> i64 = unsafe { std::mem::transmute(code_ptr) };
-        println!("{}", main());
-
-        Ok(())
+        std::process::exit(main() as i32);
     }
 }
