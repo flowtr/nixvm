@@ -1,0 +1,13 @@
+[package]
+name = "nix-llvm"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+rnix = "0.11.0"
+cranelift-codegen = "0.94.0"
+cranelift-module = "0.94.0"
+cranelift-jit = "0.94.0"
+cranelift-frontend = "0.94.0"
+anyhow = "1.0.70"
+
